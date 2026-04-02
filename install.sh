@@ -5,41 +5,39 @@ set -e
 PROJECT="/Amnezia"
 BASE="$PROJECT/clients"
 SCRIPTS="$PROJECT/scripts"
-KEYS_DIR="$PROJECT/keys"
+KEYS="$PROJECT/keys"
 WG_IF="wg0"
 WG_PORT="443"
 GEOIP_URL="https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/text/ru-blocked.txt"
 GEOSITE_URL="https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/ru-blocked.txt"
 
-# ===== Создание папок =====
-mkdir -p "$BASE" "$SCRIPTS" "$KEYS_DIR"
-chmod 700 "$KEYS_DIR"
+# ===== Создаем папки =====
+mkdir -p "$BASE" "$SCRIPTS" "$KEYS"
+chmod 700 "$KEYS"
 
 # ===== Установка пакетов =====
 apt update
 apt install -y wireguard nftables dnsmasq curl zip iptables
 
-# ===== Генерация ключей сервера =====
-if [ ! -f "$KEYS_DIR/server.key" ]; then
-    wg genkey | tee "$KEYS_DIR/server.key" | wg pubkey > "$KEYS_DIR/server.pub"
-    chmod 600 "$KEYS_DIR/server.key" "$KEYS_DIR/server.pub"
+# ===== Генерация ключей =====
+if [ ! -f "$KEYS/server.key" ]; then
+    wg genkey | tee "$KEYS/server.key" | wg pubkey > "$KEYS/server.pub"
+    chmod 600 "$KEYS/server.key" "$KEYS/server.pub"
 fi
-SERVER_PRIV=$(cat "$KEYS_DIR/server.key")
-SERVER_PUB=$(cat "$KEYS_DIR/server.pub")
+SERVER_PRIV=$(cat "$KEYS/server.key")
+SERVER_PUB=$(cat "$KEYS/server.pub")
 
-# ===== Определение внешнего IP с fallback =====
+# ===== Определяем внешний IP =====
 SERVER_IP=$(curl -sf ifconfig.me || curl -sf ipinfo.io/ip || curl -sf icanhazip.com)
+SERVER_IP=${SERVER_IP:-$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1)}}}')}
 if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1)}}}')
-fi
-if [[ -z "$SERVER_IP" ]]; then
-    echo "Ошибка: не удалось определить внешний IP"
+    echo "Не удалось определить внешний IP"
     exit 1
 fi
 
-# ===== Конфиг WireGuard =====
+# ===== WireGuard конфиг =====
 mkdir -p /etc/wireguard
-cat > "$PROJECT/$WG_IF.conf" <<EOF
+cat > /etc/wireguard/$WG_IF.conf <<EOF
 [Interface]
 PrivateKey = $SERVER_PRIV
 Address = 10.66.66.1/24
@@ -54,19 +52,15 @@ PostUp = iptables -t nat -C PREROUTING -i $WG_IF -p tcp --dport 53 -j REDIRECT -
 PostDown = iptables -t nat -D PREROUTING -i $WG_IF -p udp --dport 53 -j REDIRECT --to-ports 53 || true
 PostDown = iptables -t nat -D PREROUTING -i $WG_IF -p tcp --dport 53 -j REDIRECT --to-ports 53 || true
 EOF
-
-# Копируем конфиг в /etc/wireguard
-cp "$PROJECT/$WG_IF.conf" /etc/wireguard/
 chmod 600 /etc/wireguard/$WG_IF.conf
 
 # ===== nftables =====
-cat > "$PROJECT/nftables.conf" <<EOF
+cat > $PROJECT/nftables.conf <<EOF
 table inet wg {
     set geo_block {
         type ipv4_addr
         flags interval
     }
-
     chain output {
         type route hook output priority mangle;
         ip daddr @geo_block mark set 1
@@ -74,14 +68,22 @@ table inet wg {
 }
 EOF
 
-# ===== dnsmasq =====
-if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+# ===== systemd-resolved =====
+if systemctl is-active --quiet systemd-resolved; then
     systemctl stop systemd-resolved
     systemctl disable systemd-resolved
     rm -f /etc/resolv.conf
     echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
 fi
 
+# ===== Поднимаем WireGuard перед dnsmasq =====
+wg-quick up /etc/wireguard/$WG_IF.conf || true
+
+# ===== Таблица маршрутизации для geo_block =====
+ip rule add fwmark 1 table 100 2>/dev/null || true
+ip route add default dev $WG_IF table 100 2>/dev/null || true
+
+# ===== dnsmasq =====
 cat > /etc/dnsmasq.d/wg.conf <<EOF
 no-resolv
 server=1.1.1.1
@@ -96,51 +98,16 @@ EOF
 systemctl enable dnsmasq
 systemctl restart dnsmasq
 
-# ===== Скрипты обновления =====
-cat > "$SCRIPTS/update-geoip.sh" <<EOF
-#!/bin/bash
-TMP="/tmp/geoip.txt"
-curl -sfL $GEOIP_URL -o \$TMP || exit 1
-nft delete set inet wg geo_block 2>/dev/null || true
-nft add set inet wg geo_block { type ipv4_addr; flags interval; }
-for ip in \$(cat \$TMP); do
-    nft add element inet wg geo_block { \$ip }
-done
-EOF
-
-cat > "$SCRIPTS/update-domains.sh" <<EOF
-#!/bin/bash
-TMP="/tmp/domains.txt"
-CONF="/etc/dnsmasq.d/wg-domains.conf"
-curl -sfL $GEOSITE_URL -o \$TMP || exit 1
-> \$CONF
-while read d; do
-    echo "nftset=/\$d/inet#wg#geo_block" >> \$CONF
-done < \$TMP
-systemctl restart dnsmasq
-EOF
-
-chmod +x "$SCRIPTS/update-geoip.sh" "$SCRIPTS/update-domains.sh"
-
 # ===== TCP BBR =====
 grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
 grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
 sysctl -p
 
-# ===== Поднятие WireGuard и маршрутизации =====
-wg-quick up $WG_IF || true
-
-# Создание таблицы маршрутизации 100 после поднятия интерфейса
-ip rule show | grep -q "fwmark 1" || ip rule add fwmark 1 table 100
-ip route show table 100 | grep -q "$WG_IF" || ip route add default dev $WG_IF table 100
-
+# ===== Автозапуск WireGuard =====
 systemctl enable wg-quick@$WG_IF
 systemctl restart wg-quick@$WG_IF
 
-# ===== Завершение =====
 echo "----------------------------------"
-echo "ГОТОВО! WireGuard успешно поднят и готов к использованию."
-echo "Конфиг: /etc/wireguard/$WG_IF.conf"
-echo "Все скрипты и клиенты находятся в $PROJECT"
-echo "Панель управления: $PROJECT/wg-panel"
+echo "Установка завершена. WireGuard поднят, dnsmasq слушает 10.66.66.1"
+echo "Конфиг wg0: /etc/wireguard/$WG_IF.conf"
 echo "----------------------------------"
