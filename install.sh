@@ -1,45 +1,34 @@
 #!/bin/bash
 set -e
 
-# ===== Параметры =====
+# ===== Параметры сервера =====
 WG_IF="wg0"
 WG_PORT="443"
+BASE="/Amnezia/clients"
+SCRIPTS="/Amnezia/scripts"
 PROJECT="/Amnezia"
-BASE="$PROJECT/clients"
-SCRIPTS="$PROJECT/scripts"
+
 GEOIP_URL="https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/text/ru-blocked.txt"
 GEOSITE_URL="https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/ru-blocked.txt"
 
-# ===== Очистка старого =====
-systemctl stop wg-quick@$WG_IF 2>/dev/null || true
-systemctl disable wg-quick@$WG_IF 2>/dev/null || true
-systemctl stop dnsmasq 2>/dev/null || true
-systemctl disable dnsmasq 2>/dev/null || true
-ip link show $WG_IF &>/dev/null && wg-quick down $WG_IF || true
-rm -rf "$PROJECT" /etc/wireguard/$WG_IF.conf /etc/dnsmasq.d/wg.conf
-nft flush table inet wg 2>/dev/null || true
-iptables -t nat -D PREROUTING -i $WG_IF -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
-iptables -t nat -D PREROUTING -i $WG_IF -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
-ip rule del fwmark 1 table 100 2>/dev/null || true
-ip route flush table 100 2>/dev/null || true
-
-# ===== Создаем папки =====
+# ===== Создаём папки =====
+echo "[1/12] Создаём папки проекта ..."
 mkdir -p "$BASE" "$SCRIPTS"
 
 # ===== Установка пакетов =====
+echo "[2/12] Установка пакетов ..."
 apt update
 apt install -y wireguard nftables dnsmasq curl zip iptables
 
 # ===== Генерация ключей сервера =====
+echo "[3/12] Генерация ключей сервера ..."
 wg genkey | tee "$PROJECT/server.key" | wg pubkey > "$PROJECT/server.pub"
+chmod 600 "$PROJECT/server.key"
 SERVER_PRIV=$(cat "$PROJECT/server.key")
 SERVER_PUB=$(cat "$PROJECT/server.pub")
 
-# ===== Определение внешнего IP =====
-EXTERNAL_IP=$(curl -sf4 ifconfig.me || ip route get 1.1.1.1 | awk '{print $7; exit}')
-[ -z "$EXTERNAL_IP" ] && echo "Не удалось определить внешний IP" && exit 1
-
 # ===== Конфиг WireGuard =====
+echo "[4/12] Создаём конфиг WireGuard ..."
 cat > "$PROJECT/$WG_IF.conf" <<EOF
 [Interface]
 PrivateKey = $SERVER_PRIV
@@ -59,6 +48,7 @@ PostDown = iptables -t nat -D PREROUTING -i $WG_IF -p tcp --dport 53 -j REDIRECT
 EOF
 
 # ===== nftables =====
+echo "[5/12] Создаём nftables ..."
 cat > "$PROJECT/nftables.conf" <<EOF
 table inet wg {
     set geo_block {
@@ -76,8 +66,16 @@ EOF
 ip rule add fwmark 1 table 100 2>/dev/null || true
 ip route add default dev $WG_IF table 100 2>/dev/null || true
 
+# ===== Поднимаем WireGuard интерфейс до dnsmasq =====
+echo "[6/12] Поднимаем интерфейс WireGuard ..."
+wg-quick up "$PROJECT/$WG_IF.conf" || true
+systemctl enable wg-quick@$WG_IF
+
 # ===== dnsmasq =====
+echo "[7/12] Настройка dnsmasq ..."
+# Отключаем systemd-resolved, если он мешает
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    echo "  Отключаем systemd-resolved..."
     systemctl stop systemd-resolved
     systemctl disable systemd-resolved
     rm -f /etc/resolv.conf
@@ -99,6 +97,7 @@ systemctl enable dnsmasq
 systemctl restart dnsmasq
 
 # ===== Скрипты обновления =====
+echo "[8/12] Создаём скрипты обновления ..."
 cat > "$SCRIPTS/update-geoip.sh" <<EOF
 #!/bin/bash
 TMP="/tmp/geoip.txt"
@@ -128,14 +127,19 @@ EOF
 
 chmod +x "$SCRIPTS/update-geoip.sh" "$SCRIPTS/update-domains.sh"
 
-# ===== Запуск обновлений и WireGuard =====
+# ===== TCP BBR =====
+echo "[9/12] Включение TCP BBR ..."
+grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+sysctl -p
+
+# ===== Финальный апдейт и запуск =====
+echo "[10/12] Обновляем geoip и geosite ..."
 "$SCRIPTS/update-geoip.sh"
 "$SCRIPTS/update-domains.sh"
 
-systemctl enable wg-quick@$WG_IF
-wg-quick up $PROJECT/$WG_IF.conf
-
-echo "=================================="
-echo "Установка завершена. WireGuard wg0 поднят."
-echo "Панель управления и скрипты в $PROJECT"
-echo "=================================="
+echo "----------------------------------"
+echo "Установка завершена!"
+echo "Панель управления: $PROJECT/wg-panel"
+echo "Все клиенты и скрипты находятся в $PROJECT"
+echo "----------------------------------"
